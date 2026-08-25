@@ -1,0 +1,77 @@
+{
+  "method": "target_aligned",
+  "common": {
+    "seed": 13,
+    "sql_sft_epochs": 1,
+    "gradient_clip": 1.0,
+    "optimizer": {
+      "name": "AdamW",
+      "betas": [0.9, 0.95],
+      "weight_decay": 0.01
+    },
+    "adapter_type": "output",
+    "adapter_dim": 96,
+    "adapter_top_k": 6,
+    "lora_alpha_multiplier": 2,
+    "lora_dropout": 0.05,
+    "sql_sft_weight": 0.2,
+    "code_sft_weight": 0.1,
+    "auxiliary_weight": 0.3,
+    "max_aux_scale": 2.0,
+    "reference_kl_weight": 0.02,
+    "kl_token_chunk_size": 8,
+    "anchor_examples": 256,
+    "anchor_batch_size": 16,
+    "anchor_refresh_steps": 8,
+    "anchor_ema_beta": 0.9,
+    "source_reward_warmup": 32,
+    "source_reward_beta": 0.95,
+    "source_reward_std_floor": 0.1,
+    "source_reward_clip": 2.0,
+    "rl_loss": "ema_reinforce",
+    "rollout_temperature": 0.8,
+    "rollout_top_p": 1.0,
+    "code_new_tokens": 128,
+    "interpolation_alpha": 0.25,
+    "rl_updates": 1362
+  },
+  "profiles": {
+    "qwen3_0.6b_wikisql": {
+      "model": "Qwen/Qwen3-0.6B",
+      "learning_rate": 0.0001,
+      "lora_rank": 8,
+      "max_length": 512,
+      "sql_new_tokens": 48,
+      "sft_batch_size": 16,
+      "sft_gradient_accumulation": 1,
+      "eval_batch_size": 64
+    },
+    "qwen3_0.6b_spider_bird": {
+      "model": "Qwen/Qwen3-0.6B",
+      "learning_rate": 0.0001,
+      "lora_rank": 8,
+      "max_length": 3072,
+      "sql_new_tokens": 256,
+      "sft_batch_size": 1,
+      "sft_gradient_accumulation": 16,
+      "eval_batch_size": 1
+    },
+    "smollm3_3b_spider_bird": {
+      "model": "HuggingFaceTB/SmolLM3-3B",
+      "model_revision": "a07cc9a04f16550a088caea529712d1d335b0ac1",
+      "learning_rate": 0.00005,
+      "lora_rank": 16,
+      "max_length": 3072,
+      "sql_new_tokens": 256,
+      "sft_batch_size": 1,
+      "sft_gradient_accumulation": 16,
+      "eval_batch_size": 2
+    }
+  },
+  "evaluators": {
+    "spider_test_suite_commit": "e97acc546ecbee8fa27fa8dbf025ef61493a876c",
+    "bird_commit": "483554eae102996f5ec1f4feab4e78ef29c2a394",
+    "sqlite_progress_steps": 2000000,
+    "wall_timeout_seconds": 30
+  }
+}
