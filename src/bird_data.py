@@ -15,6 +15,8 @@ from urllib.parse import quote
 import sqlglot
 from sqlglot import expressions as exp
 
+import data_protocol
+
 
 def quote_identifier(value: object) -> str:
     return '"' + str(value).replace('"', '""') + '"'
@@ -238,27 +240,28 @@ def load_bird_data(config: Any):
         database_id: schema_text(table) for database_id, table in tables.items()
     }
 
-    anchor_ids = choose_anchor_database_ids(
-        train_rows, config.anchor_examples, config.seed + 31
+    split = data_protocol.split_training_indices(
+        len(train_rows),
+        config.anchor_examples,
+        config.seed + 31,
+        limit=config.sql_train_limit,
     )
-    sql_anchor = [row for row in train_rows if str(row["db_id"]) in anchor_ids]
-    sql_train = [row for row in train_rows if str(row["db_id"]) not in anchor_ids]
-    if config.sql_train_limit > 0:
-        indices = list(range(len(sql_train)))
-        random.Random(config.seed + 47).shuffle(indices)
-        sql_train = [sql_train[index] for index in indices[: config.sql_train_limit]]
+    sql_train = [train_rows[index] for index in split.optimization]
+    sql_anchor = [train_rows[index] for index in split.anchor]
+    sql_model_selection = [train_rows[index] for index in split.model_selection]
     if config.sql_eval_limit > 0:
         dev_rows = dev_rows[: config.sql_eval_limit]
 
     train_ids = {str(row["db_id"]) for row in sql_train}
     observed_anchor_ids = {str(row["db_id"]) for row in sql_anchor}
+    selection_ids = {str(row["db_id"]) for row in sql_model_selection}
     dev_ids = {str(row["db_id"]) for row in dev_rows}
-    if train_ids & observed_anchor_ids:
-        raise ValueError("BIRD SQL train and anchor database IDs overlap")
-    if (train_ids | observed_anchor_ids) & dev_ids:
-        raise ValueError("BIRD train/anchor and dev database IDs overlap")
+    if (train_ids | observed_anchor_ids | selection_ids) & dev_ids:
+        raise ValueError("BIRD official train and development database IDs overlap")
 
-    missing_train_schemas = sorted((train_ids | observed_anchor_ids) - set(train_schemas))
+    missing_train_schemas = sorted(
+        (train_ids | observed_anchor_ids | selection_ids) - set(train_schemas)
+    )
     if missing_train_schemas:
         raise KeyError(f"missing BIRD train schemas: {missing_train_schemas}")
     dev_schemas = {
@@ -290,7 +293,12 @@ def load_bird_data(config: Any):
             for row in rows
         ]
 
-    return attach_train(sql_train), attach_train(sql_anchor), attach_dev(dev_rows)
+    return (
+        attach_train(sql_train),
+        attach_train(sql_anchor),
+        attach_train(sql_model_selection),
+        attach_dev(dev_rows),
+    )
 
 
 def extract_bird_sql(text: str) -> str:

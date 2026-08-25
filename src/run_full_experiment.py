@@ -19,7 +19,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, fields
+from collections import Counter
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -31,6 +32,7 @@ from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import code_data  # noqa: E402
+import data_protocol  # noqa: E402
 import run_pilot as core  # noqa: E402
 
 
@@ -40,9 +42,27 @@ BRANCH_NAMES = (
     "norm_matched",
     "source_normalized",
     "projection_only",
+    "alignment_only",
+    "matched_retention",
     "target_aligned",
     "code_sft_only",
 )
+
+PAPER_CODE_SOURCE_COUNTS = {
+    "mbpp": 369,
+    "apps": 493,
+    "codecontests": 500,
+}
+PAPER_CODE_TASKS = sum(PAPER_CODE_SOURCE_COUNTS.values())
+
+
+def paper_lora_rank(model_name: str) -> int:
+    return 16 if "smollm3" in model_name.casefold() else 8
+
+
+def option_was_provided(argv: Sequence[str] | None, option: str) -> bool:
+    values = list(sys.argv[1:] if argv is None else argv)
+    return any(value == option or value.startswith(option + "=") for value in values)
 
 # Full code corpora commonly use ``sys.stdin``. Keep it available while
 # rejecting process, network, and filesystem access inside verifier programs.
@@ -77,7 +97,8 @@ class FullConfig:
     temperature: float = 0.8
     top_p: float = 1.0
     rl_loss: str = "ema_reinforce"
-    reference_kl_weight: float = 0.0
+    reference_kl_weight: float = 0.02
+    checkpoint_interpolation_alpha: float = 0.25
     kl_token_chunk_size: int = 8
     sql_sft_epochs: int = 1
     sft_batch_size: int = 16
@@ -94,9 +115,9 @@ class FullConfig:
     source_reward_beta: float = 0.95
     source_reward_std_floor: float = 0.10
     source_reward_clip: float = 2.0
-    code_sources: str = "mbpp,apps,codecontests,taco"
+    code_sources: str = "mbpp,apps,codecontests"
     code_pilot_cap: int = 0
-    rl_steps: int = 0
+    rl_steps: int = PAPER_CODE_TASKS
     experiment_dir: str = "full_experiment"
     smoke: bool = False
 
@@ -109,15 +130,34 @@ class BranchSpec:
     source_normalized: bool = False
     project_conflicts: bool = False
     anchor_gate: bool = False
+    uses_reference_kl: bool = False
+    uses_checkpoint_interpolation: bool = False
 
 
 BRANCH_SPECS = {
-    "sql_only": BranchSpec(False, uses_code_reward=False),
+    "sql_only": BranchSpec(
+        False,
+        uses_code_reward=False,
+        uses_reference_kl=True,
+        uses_checkpoint_interpolation=True,
+    ),
     "naive_mixed": BranchSpec(True),
     "norm_matched": BranchSpec(True, norm_match=True),
     "source_normalized": BranchSpec(True, norm_match=True, source_normalized=True),
     "projection_only": BranchSpec(
         True, norm_match=True, source_normalized=True, project_conflicts=True
+    ),
+    "alignment_only": BranchSpec(
+        True,
+        norm_match=True,
+        source_normalized=True,
+        project_conflicts=True,
+        anchor_gate=True,
+    ),
+    "matched_retention": BranchSpec(
+        True,
+        uses_reference_kl=True,
+        uses_checkpoint_interpolation=True,
     ),
     "target_aligned": BranchSpec(
         True,
@@ -125,6 +165,8 @@ BRANCH_SPECS = {
         source_normalized=True,
         project_conflicts=True,
         anchor_gate=True,
+        uses_reference_kl=True,
+        uses_checkpoint_interpolation=True,
     ),
     "code_sft_only": BranchSpec(True, uses_code_reward=False),
 }
@@ -216,6 +258,59 @@ def atomic_save_trainable(model: core.DomainModel, path: Path) -> dict[str, int]
     del state
     release_cuda_memory()
     return manifest
+
+
+def load_trainable_state(
+    model: core.DomainModel, state: Mapping[str, torch.Tensor]
+) -> None:
+    missing, unexpected = model.load_state_dict(dict(state), strict=False)
+    relevant_missing = [
+        name
+        for name in missing
+        if "lora_" in name or name.startswith("private_adapters.")
+    ]
+    if relevant_missing or unexpected:
+        raise RuntimeError(
+            "trainable checkpoint mismatch: "
+            f"missing={relevant_missing}, unexpected={unexpected}"
+        )
+
+
+def deploy_branch_checkpoint(
+    model: core.DomainModel,
+    sft_checkpoint: Path,
+    branch_dir: Path,
+    spec: BranchSpec,
+    alpha: float,
+) -> dict[str, Any]:
+    """Save the post-RL state and apply retention when the branch requires it."""
+
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("checkpoint interpolation alpha must be in [0, 1]")
+    if not spec.uses_checkpoint_interpolation:
+        manifest = atomic_save_trainable(model, branch_dir / "trainable.pt")
+        return {"applied": False, "alpha": None, "checkpoint": "trainable.pt", **manifest}
+
+    post_rl_path = branch_dir / "post_rl_trainable.pt"
+    atomic_save_trainable(model, post_rl_path)
+    sft_state = _load_trainable_state(sft_checkpoint)
+    rl_state = _load_trainable_state(post_rl_path)
+    if sft_state.keys() != rl_state.keys():
+        raise ValueError("SQL-SFT and post-RL checkpoint parameter sets do not match")
+    deployed = {
+        name: sft_state[name] + alpha * (rl_state[name] - sft_state[name])
+        for name in sft_state
+    }
+    validate_trainable_state(deployed)
+    load_trainable_state(model, deployed)
+    manifest = atomic_save_trainable(model, branch_dir / "trainable.pt")
+    return {
+        "applied": True,
+        "alpha": alpha,
+        "post_rl_checkpoint": post_rl_path.name,
+        "checkpoint": "trainable.pt",
+        **manifest,
+    }
 
 
 def format_prompt(tokenizer: Any, prompt: str) -> list[int]:
@@ -588,9 +683,35 @@ def build_training_code_pool(
     source_rows: Sequence[code_data.SourceRows] | None = None,
     verifier: code_data.VerifierLike | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    requested = [item.strip() for item in config.code_sources.split(",") if item.strip()]
-    pilot_cap = config.code_pilot_cap if config.code_pilot_cap > 0 else None
-    if source_rows is None and verifier is None and len(requested) > 1:
+    requested = [
+        code_data.canonical_source(item.strip())
+        for item in config.code_sources.split(",")
+        if item.strip()
+    ]
+    if len(requested) != len(set(requested)):
+        raise ValueError("code sources must be unique")
+    paper_build = (
+        source_rows is None
+        and verifier is None
+        and requested == list(PAPER_CODE_SOURCE_COUNTS)
+        and config.code_pilot_cap == 0
+    )
+    pilot_cap: code_data.PilotCap
+    if config.code_pilot_cap > 0:
+        pilot_cap = config.code_pilot_cap
+    elif paper_build:
+        pilot_cap = PAPER_CODE_SOURCE_COUNTS
+    else:
+        pilot_cap = None
+
+    # The paper pool uses one globally deduplicated pass so that the retained
+    # per-source counts are exact after cross-source statement deduplication.
+    if paper_build:
+        rows = [_load_source_rows(source) for source in requested]
+        result = code_data.build_code_pool(
+            rows, SandboxReferenceVerifier(), pilot_cap=pilot_cap
+        )
+    elif source_rows is None and verifier is None and len(requested) > 1:
         worker_count = min(4, len(requested))
         context = multiprocessing.get_context("spawn")
         with concurrent.futures.ProcessPoolExecutor(
@@ -600,7 +721,13 @@ def build_training_code_pool(
             partial_results = list(
                 executor.map(
                     _build_requested_code_source,
-                    [(source, pilot_cap) for source in requested],
+                    [
+                        (
+                            source,
+                            pilot_cap if isinstance(pilot_cap, int) else None,
+                        )
+                        for source in requested
+                    ],
                 )
             )
         result = _merge_code_build_results(partial_results)
@@ -613,9 +740,21 @@ def build_training_code_pool(
         result = code_data.build_code_pool(
             rows, verifier or SandboxReferenceVerifier(), pilot_cap=pilot_cap
         )
+    manifest = dict(result.manifest)
+    if paper_build:
+        observed = Counter(task.source for task in result.tasks)
+        if dict(observed) != PAPER_CODE_SOURCE_COUNTS:
+            raise RuntimeError(
+                "paper code pool has the wrong verified source counts: "
+                f"expected={PAPER_CODE_SOURCE_COUNTS}, observed={dict(observed)}"
+            )
+        manifest["mode"] = "paper"
+        manifest["paper_source_counts"] = dict(PAPER_CODE_SOURCE_COUNTS)
+        manifest["paper_total"] = PAPER_CODE_TASKS
+
     records = [_task_training_record(task) for task in result.tasks]
     random.Random(config.seed + 5).shuffle(records)
-    return records, result.manifest
+    return records, manifest
 
 
 def load_sql_data(config: FullConfig):
@@ -623,22 +762,26 @@ def load_sql_data(config: FullConfig):
     train = dataset["train"]
     validation_name = "validation" if "validation" in dataset else "dev"
     validation = dataset[validation_name]
-    train_count = (
-        len(train)
-        if config.sql_train_limit <= 0
-        else min(config.sql_train_limit, len(train))
+    split = data_protocol.split_training_indices(
+        len(train),
+        config.anchor_examples,
+        config.seed + 31,
+        limit=config.sql_train_limit,
     )
-    anchor_count = min(config.anchor_examples, max(1, train_count // 20))
-    indices = list(range(train_count))
-    random.Random(config.seed + 31).shuffle(indices)
-    sql_anchor = train.select(sorted(indices[:anchor_count]))
-    sql_train = train.select(sorted(indices[anchor_count:]))
+    sql_train = train.select(list(split.optimization))
+    sql_anchor = train.select(list(split.anchor))
+    sql_model_selection = train.select(list(split.model_selection))
     eval_count = (
         len(validation)
         if config.sql_eval_limit <= 0
         else min(config.sql_eval_limit, len(validation))
     )
-    return sql_train, sql_anchor, validation.select(range(eval_count))
+    return (
+        sql_train,
+        sql_anchor,
+        sql_model_selection,
+        validation.select(range(eval_count)),
+    )
 
 
 def _supervised_ids(
@@ -1256,8 +1399,10 @@ def train_branch(
         raise ValueError("reference_kl_weight must be finite and non-negative")
     if config.anchor_micro_batch_size < 0:
         raise ValueError("anchor_micro_batch_size must be non-negative")
-    if config.reference_kl_weight > 0.0 and branch != "target_aligned":
-        raise ValueError("reference-policy KL is registered only for an M5 candidate")
+    effective_kl_weight = (
+        config.reference_kl_weight if spec.uses_reference_kl else 0.0
+    )
+    loss_config = replace(config, reference_kl_weight=effective_kl_weight)
     optimizer = core.optimizer_for(model, config.learning_rate)
     shared = model.shared_parameters()
     sql_private = model.private_parameters("sql")
@@ -1265,7 +1410,7 @@ def train_branch(
     primary_parameters = [*shared, *sql_private]
     reference_parameters = (
         core.snapshot_trainable_parameters(model)
-        if config.reference_kl_weight > 0.0
+        if effective_kl_weight > 0.0
         else None
     )
     steps = config.rl_steps if config.rl_steps > 0 else len(code_pool)
@@ -1322,7 +1467,7 @@ def train_branch(
             "sql",
             sql_example,
             sql_baseline,
-            config,
+            loss_config,
             **sql_rollout_kwargs,
         )
         sql_baseline = 0.9 * sql_baseline + 0.1 * float(sql_record["reward"])
@@ -1428,6 +1573,7 @@ def train_branch(
             "sql_score_timeout": sql_record.get("error") == "score_timeout",
             "sql_reference_kl": sql_record.get("reference_kl", 0.0),
             "sql_reference_kl_loss": sql_record.get("reference_kl_loss", 0.0),
+            "sql_reference_kl_weight": effective_kl_weight,
             "code_reward": code_record.get("reward"),
             "code_source": code_record.get("source"),
             "code_task_id": code_record.get("task_id"),
@@ -1544,9 +1690,14 @@ def evaluate_full_wikisql(
         "name": branch,
         "examples": count,
         "exact_match": totals["exact"] / count,
-        "execution_rate": totals["executable"] / count,
+        "valid_query_rate": totals["executable"] / count,
         "denotation_accuracy": totals["denotation"] / count,
         "mean_reward": totals["reward"] / count,
+        "metric_definitions": {
+            "denotation_accuracy": "WikiSQL execution-result accuracy",
+            "exact_match": "normalized SQL exact match",
+            "valid_query_rate": "fraction of generated SQL that parses and executes without error",
+        },
         "seconds": time.time() - started,
     }
 
@@ -1574,10 +1725,27 @@ def load_saved_code_pool(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+def validate_code_pool(records: Sequence[Mapping[str, Any]], config: FullConfig) -> None:
+    requested = [
+        code_data.canonical_source(item.strip())
+        for item in config.code_sources.split(",")
+        if item.strip()
+    ]
+    if config.code_pilot_cap > 0 or requested != list(PAPER_CODE_SOURCE_COUNTS):
+        return
+    observed = Counter(str(record.get("source", "")) for record in records)
+    if dict(observed) != PAPER_CODE_SOURCE_COUNTS:
+        raise ValueError(
+            "the saved code pool does not match the paper: "
+            f"expected={PAPER_CODE_SOURCE_COUNTS}, observed={dict(observed)}"
+        )
+
+
 def save_data_manifest(
     experiment_dir: Path,
     sql_train: Sequence[Mapping[str, Any]],
     sql_anchor: Sequence[Mapping[str, Any]],
+    sql_model_selection: Sequence[Mapping[str, Any]],
     sql_eval: Sequence[Mapping[str, Any]],
     code_manifest: Mapping[str, Any],
 ) -> None:
@@ -1585,9 +1753,11 @@ def save_data_manifest(
         experiment_dir / "data_manifest.json",
         {
             "sql_dataset": "Salesforce/wikisql",
-            "sql_train_examples": len(sql_train),
+            "sql_training_partition_examples": len(sql_train) + len(sql_anchor),
+            "sql_optimization_examples": len(sql_train),
             "sql_anchor_examples": len(sql_anchor),
-            "sql_eval_examples": len(sql_eval),
+            "sql_model_selection_examples": len(sql_model_selection),
+            "sql_evaluation_examples": len(sql_eval),
             "code": code_manifest,
         },
     )
@@ -1603,7 +1773,7 @@ def prepare(config: FullConfig) -> None:
     write_json(experiment_dir / "config.json", asdict(config))
     core.seed_everything(config.seed)
     tokenizer = tokenizer_for(config)
-    sql_train, sql_anchor, sql_eval = load_sql_data(config)
+    sql_train, sql_anchor, sql_model_selection, sql_eval = load_sql_data(config)
     # Code-reference validation is CPU-heavy and independent of SQL SFT. Build
     # it concurrently so preparation does not leave the GPU idle.
     with concurrent.futures.ThreadPoolExecutor(
@@ -1637,7 +1807,12 @@ def prepare(config: FullConfig) -> None:
         raise RuntimeError("verified code pool is empty")
     save_code_pool(experiment_dir / "code_pool.jsonl", code_pool)
     save_data_manifest(
-        experiment_dir, sql_train, sql_anchor, sql_eval, code_manifest
+        experiment_dir,
+        sql_train,
+        sql_anchor,
+        sql_model_selection,
+        sql_eval,
+        code_manifest,
     )
     print(
         json.dumps(
@@ -1659,7 +1834,7 @@ def prepare_checkpoint(config: FullConfig) -> None:
     write_json(experiment_dir / "config.json", asdict(config))
     core.seed_everything(config.seed)
     tokenizer = tokenizer_for(config)
-    sql_train, sql_anchor, sql_eval = load_sql_data(config)
+    sql_train, sql_anchor, sql_model_selection, sql_eval = load_sql_data(config)
     model = core.build_model(config, tokenizer)
     write_json(
         experiment_dir / "model_manifest.json",
@@ -1685,6 +1860,7 @@ def prepare_checkpoint(config: FullConfig) -> None:
         experiment_dir,
         sql_train,
         sql_anchor,
+        sql_model_selection,
         sql_eval,
         {"status": "not_built", "reason": "adapter checkpoint preparation only"},
     )
@@ -1702,13 +1878,18 @@ def finish_prepare(config: FullConfig) -> None:
         raise FileExistsError("refusing to overwrite an existing verified code pool")
 
     core.seed_everything(config.seed)
-    sql_train, sql_anchor, sql_eval = load_sql_data(config)
+    sql_train, sql_anchor, sql_model_selection, sql_eval = load_sql_data(config)
     code_pool, code_manifest = build_training_code_pool(config)
     if not code_pool:
         raise RuntimeError("verified code pool is empty")
     save_code_pool(experiment_dir / "code_pool.jsonl", code_pool)
     save_data_manifest(
-        experiment_dir, sql_train, sql_anchor, sql_eval, code_manifest
+        experiment_dir,
+        sql_train,
+        sql_anchor,
+        sql_model_selection,
+        sql_eval,
+        code_manifest,
     )
     print(
         json.dumps(
@@ -1727,7 +1908,7 @@ def evaluate_checkpoint(config: FullConfig) -> None:
     output_dir.mkdir(parents=True, exist_ok=False)
     core.seed_everything(config.seed + 89)
     tokenizer = tokenizer_for(config)
-    _, _, sql_eval = load_sql_data(config)
+    _, _, _, sql_eval = load_sql_data(config)
     model = core.restore_model(
         config, tokenizer, experiment_dir / "common_sql_trainable.pt"
     )
@@ -1750,8 +1931,9 @@ def branch(config: FullConfig, branch_name: str) -> None:
     write_json(branch_dir / "config.json", {**asdict(config), "branch": branch_name})
     core.seed_everything(config.seed + 101)
     tokenizer = tokenizer_for(config)
-    sql_train, sql_anchor, sql_eval = load_sql_data(config)
+    sql_train, sql_anchor, _, sql_eval = load_sql_data(config)
     code_pool = load_saved_code_pool(experiment_dir / "code_pool.jsonl")
+    validate_code_pool(code_pool, config)
     model = core.restore_model(
         config, tokenizer, experiment_dir / "common_sql_trainable.pt"
     )
@@ -1766,7 +1948,14 @@ def branch(config: FullConfig, branch_name: str) -> None:
         branch_dir / "trace.jsonl",
     )
     release_cuda_memory()
-    atomic_save_trainable(model, branch_dir / "trainable.pt")
+    deployment = deploy_branch_checkpoint(
+        model,
+        experiment_dir / "common_sql_trainable.pt",
+        branch_dir,
+        branch_spec(branch_name),
+        config.checkpoint_interpolation_alpha,
+    )
+    write_json(branch_dir / "deployment.json", deployment)
     release_cuda_memory()
     summary = evaluate_full_wikisql(
         branch_name,
@@ -1776,6 +1965,12 @@ def branch(config: FullConfig, branch_name: str) -> None:
         config,
         branch_dir / "predictions.jsonl",
     )
+    summary["reference_kl_weight"] = (
+        config.reference_kl_weight
+        if branch_spec(branch_name).uses_reference_kl
+        else 0.0
+    )
+    summary["checkpoint_interpolation_alpha"] = deployment["alpha"]
     write_json(branch_dir / "summary.json", summary)
     print(json.dumps(summary, indent=2), flush=True)
 
@@ -1827,7 +2022,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alignment-temperature", type=float, default=0.02)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--reference-kl-weight", type=float, default=0.0)
+    parser.add_argument("--reference-kl-weight", type=float, default=0.02)
+    parser.add_argument(
+        "--checkpoint-interpolation-alpha", type=float, default=0.25
+    )
     parser.add_argument("--kl-token-chunk-size", type=int, default=8)
     parser.add_argument("--sql-sft-epochs", type=int, default=1)
     parser.add_argument("--sft-batch-size", type=int, default=16)
@@ -1849,14 +2047,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-reward-beta", type=float, default=0.95)
     parser.add_argument("--source-reward-std-floor", type=float, default=0.10)
     parser.add_argument("--source-reward-clip", type=float, default=2.0)
-    parser.add_argument("--code-sources", default="mbpp,apps,codecontests,taco")
+    parser.add_argument("--code-sources", default="mbpp,apps,codecontests")
     parser.add_argument(
         "--code-pilot-cap",
         type=int,
         default=0,
-        help="accepted tasks per source; 0 consumes the full training split",
+        help=(
+            "accepted tasks per source; 0 uses the fixed paper counts for the "
+            "default MBPP/APPS/CodeContests pool"
+        ),
     )
-    parser.add_argument("--rl-steps", type=int, default=0)
+    parser.add_argument("--rl-steps", type=int, default=PAPER_CODE_TASKS)
     parser.add_argument("--smoke", action="store_true")
     return parser
 
@@ -1878,6 +2079,8 @@ def parse_args(
         config = _config_from_values(saved)
     else:
         config = _config_from_values(vars(args))
+        if not option_was_provided(argv, "--lora-rank"):
+            config.lora_rank = paper_lora_rank(config.model)
         if config.top_p != 1.0:
             parser.error(
                 "--top-p must be 1.0 for on-policy RL; cached sampling and "
@@ -1888,6 +2091,8 @@ def parse_args(
             parser.error("--code-pilot-cap must be non-negative")
         if not math.isfinite(config.reference_kl_weight) or config.reference_kl_weight < 0.0:
             parser.error("--reference-kl-weight must be finite and non-negative")
+        if not 0.0 <= config.checkpoint_interpolation_alpha <= 1.0:
+            parser.error("--checkpoint-interpolation-alpha must be in [0, 1]")
         if config.kl_token_chunk_size < 1:
             parser.error("--kl-token-chunk-size must be positive")
         if config.sft_gradient_accumulation < 1:

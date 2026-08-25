@@ -50,11 +50,13 @@ def save_bird_manifest(
     experiment_dir: Path,
     sql_train: Sequence[Mapping[str, Any]],
     sql_anchor: Sequence[Mapping[str, Any]],
+    sql_model_selection: Sequence[Mapping[str, Any]],
     sql_eval: Sequence[Mapping[str, Any]],
     code_manifest: Mapping[str, Any],
 ) -> None:
     train_ids = sorted({str(row["db_id"]) for row in sql_train})
     anchor_ids = sorted({str(row["db_id"]) for row in sql_anchor})
+    selection_ids = sorted({str(row["db_id"]) for row in sql_model_selection})
     eval_ids = sorted({str(row["db_id"]) for row in sql_eval})
     train_root = Path(str(sql_train[0]["_database_path"])).parents[1]
     config = json.loads((experiment_dir / "config.json").read_text())
@@ -63,15 +65,15 @@ def save_bird_manifest(
         {
             "sql_dataset": "BIRD train 2023-07-11 and updated dev 2025-11-06",
             "sql_train_root": str(train_root),
-            "sql_train_examples": len(sql_train),
+            "sql_training_partition_examples": len(sql_train) + len(sql_anchor),
+            "sql_optimization_examples": len(sql_train),
             "sql_anchor_examples": len(sql_anchor),
-            "sql_eval_examples": len(sql_eval),
-            "sql_train_database_ids": train_ids,
+            "sql_model_selection_examples": len(sql_model_selection),
+            "sql_evaluation_examples": len(sql_eval),
+            "sql_optimization_database_ids": train_ids,
             "sql_anchor_database_ids": anchor_ids,
-            "sql_eval_database_ids": eval_ids,
-            "train_anchor_overlap": sorted(set(train_ids) & set(anchor_ids)),
-            "train_eval_overlap": sorted(set(train_ids) & set(eval_ids)),
-            "anchor_eval_overlap": sorted(set(anchor_ids) & set(eval_ids)),
+            "sql_model_selection_database_ids": selection_ids,
+            "sql_evaluation_database_ids": eval_ids,
             "official_evaluator_commit": config["bird_evaluator_commit"],
             "official_train_archive_sha256": (
                 "66e9e3115b59559554013aa3b124156249f30437a6b4e4f96de3d2dfb5ae8cbc"
@@ -237,13 +239,22 @@ def evaluate_bird(
     return {
         "name": branch,
         "examples": count,
+        "execution_accuracy": official["execution"],
+        "normalized_string_exact_match": totals["exact"] / count,
+        "valid_query_rate": totals["executable"] / count,
+        "local_denotation_accuracy": totals["denotation"] / count,
         "exact_match": totals["exact"] / count,
-        "execution_rate": official["execution"],
-        "denotation_accuracy": official["execution"],
-        "single_database_execution": totals["executable"] / count,
-        "single_database_denotation": totals["denotation"] / count,
         "mean_reward": totals["reward"] / count,
         "official_metric": "BIRD official execution accuracy",
+        "metric_definitions": {
+            "execution_accuracy": "official BIRD execution accuracy",
+            "exact_match": "normalized SQL string equality reported as Exact",
+            "normalized_string_exact_match": "normalized SQL string equality reported as Exact",
+            "valid_query_rate": "fraction of generated SQL that parses and executes without error",
+            "local_denotation_accuracy": (
+                "single-database execution-result equality; diagnostic only"
+            ),
+        },
         "official_gold_execution_ceiling": 0.9967,
         "seconds": time.time() - started,
     }
@@ -271,13 +282,15 @@ def finish_prepare(config: BirdConfig) -> None:
     source = Path(config.code_pool_source)
     rows = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
     if not rows:
-        raise ValueError("validated M5 code pool is empty")
+        raise ValueError("validated paper code pool is empty")
+    full.validate_code_pool(rows, config)
     shutil.copy2(source, destination)
-    sql_train, sql_anchor, sql_eval = bird_data.load_bird_data(config)
+    sql_train, sql_anchor, sql_model_selection, sql_eval = bird_data.load_bird_data(config)
     save_bird_manifest(
         experiment_dir,
         sql_train,
         sql_anchor,
+        sql_model_selection,
         sql_eval,
         _code_manifest(config, len(rows)),
     )
@@ -291,13 +304,18 @@ def finish_prepare(config: BirdConfig) -> None:
 
 
 def validate_data(config: BirdConfig) -> None:
-    sql_train, sql_anchor, sql_eval = bird_data.load_bird_data(config)
+    sql_train, sql_anchor, sql_model_selection, sql_eval = bird_data.load_bird_data(config)
     report = {
-        "train_examples": len(sql_train),
+        "training_partition_examples": len(sql_train) + len(sql_anchor),
+        "optimization_examples": len(sql_train),
         "anchor_examples": len(sql_anchor),
-        "eval_examples": len(sql_eval),
-        "train_database_ids": len({row["db_id"] for row in sql_train}),
+        "model_selection_examples": len(sql_model_selection),
+        "evaluation_examples": len(sql_eval),
+        "optimization_database_ids": len({row["db_id"] for row in sql_train}),
         "anchor_database_ids": len({row["db_id"] for row in sql_anchor}),
+        "model_selection_database_ids": len(
+            {row["db_id"] for row in sql_model_selection}
+        ),
         "eval_database_ids": len({row["db_id"] for row in sql_eval}),
         "code_pool_rows": sum(
             1 for line in Path(config.code_pool_source).read_text().splitlines() if line
@@ -367,6 +385,8 @@ def parse_args(
         config = _config_from_values(saved)
     else:
         config = _config_from_values(vars(args))
+        if not full.option_was_provided(argv, "--lora-rank"):
+            config.lora_rank = full.paper_lora_rank(config.model)
         if config.top_p != 1.0:
             parser.error("--top-p must be 1.0 for on-policy RL")
         if config.max_length <= config.sql_new_tokens:

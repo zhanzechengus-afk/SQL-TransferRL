@@ -16,6 +16,8 @@ from urllib.parse import quote
 import sqlglot
 from sqlglot import expressions as exp
 
+import data_protocol
+
 
 def quote_identifier(value: object) -> str:
     return '"' + str(value).replace('"', '""') + '"'
@@ -135,25 +137,24 @@ def load_spider_data(config: Any):
         train_rows.extend(json.loads((data_dir / filename).read_text()))
     dev_rows = json.loads((data_dir / "dev.json").read_text())
 
-    anchor_ids = choose_anchor_database_ids(
-        train_rows, config.anchor_examples, config.seed + 31
+    split = data_protocol.split_training_indices(
+        len(train_rows),
+        config.anchor_examples,
+        config.seed + 31,
+        limit=config.sql_train_limit,
     )
-    sql_anchor = [row for row in train_rows if str(row["db_id"]) in anchor_ids]
-    sql_train = [row for row in train_rows if str(row["db_id"]) not in anchor_ids]
-    if config.sql_train_limit > 0:
-        indices = list(range(len(sql_train)))
-        random.Random(config.seed + 47).shuffle(indices)
-        sql_train = [sql_train[index] for index in indices[: config.sql_train_limit]]
+    sql_train = [train_rows[index] for index in split.optimization]
+    sql_anchor = [train_rows[index] for index in split.anchor]
+    sql_model_selection = [train_rows[index] for index in split.model_selection]
     if config.sql_eval_limit > 0:
         dev_rows = dev_rows[: config.sql_eval_limit]
 
     train_ids = {str(row["db_id"]) for row in sql_train}
     observed_anchor_ids = {str(row["db_id"]) for row in sql_anchor}
+    selection_ids = {str(row["db_id"]) for row in sql_model_selection}
     dev_ids = {str(row["db_id"]) for row in dev_rows}
-    if train_ids & observed_anchor_ids:
-        raise ValueError("Spider SQL train and anchor database IDs overlap")
-    if (train_ids | observed_anchor_ids) & dev_ids:
-        raise ValueError("Spider train/anchor and dev database IDs overlap")
+    if (train_ids | observed_anchor_ids | selection_ids) & dev_ids:
+        raise ValueError("Spider official train and development database IDs overlap")
 
     def attach(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         return [
@@ -161,7 +162,12 @@ def load_spider_data(config: Any):
             for row in rows
         ]
 
-    return attach(sql_train), attach(sql_anchor), attach(dev_rows)
+    return (
+        attach(sql_train),
+        attach(sql_anchor),
+        attach(sql_model_selection),
+        attach(dev_rows),
+    )
 
 
 def extract_spider_sql(text: str) -> str:

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -74,26 +73,28 @@ def save_spider_manifest(
     experiment_dir: Path,
     sql_train: Sequence[Mapping[str, Any]],
     sql_anchor: Sequence[Mapping[str, Any]],
+    sql_model_selection: Sequence[Mapping[str, Any]],
     sql_eval: Sequence[Mapping[str, Any]],
     code_manifest: Mapping[str, Any],
 ) -> None:
     train_ids = sorted({str(row["db_id"]) for row in sql_train})
     anchor_ids = sorted({str(row["db_id"]) for row in sql_anchor})
+    selection_ids = sorted({str(row["db_id"]) for row in sql_model_selection})
     eval_ids = sorted({str(row["db_id"]) for row in sql_eval})
     full.write_json(
         experiment_dir / "data_manifest.json",
         {
             "sql_dataset": "Spider 1.0 official 2020-08 data",
             "sql_data_dir": str(sql_train[0]["_database_path"]).split("/database/")[0],
-            "sql_train_examples": len(sql_train),
+            "sql_training_partition_examples": len(sql_train) + len(sql_anchor),
+            "sql_optimization_examples": len(sql_train),
             "sql_anchor_examples": len(sql_anchor),
-            "sql_eval_examples": len(sql_eval),
-            "sql_train_database_ids": train_ids,
+            "sql_model_selection_examples": len(sql_model_selection),
+            "sql_evaluation_examples": len(sql_eval),
+            "sql_optimization_database_ids": train_ids,
             "sql_anchor_database_ids": anchor_ids,
-            "sql_eval_database_ids": eval_ids,
-            "train_anchor_overlap": sorted(set(train_ids) & set(anchor_ids)),
-            "train_eval_overlap": sorted(set(train_ids) & set(eval_ids)),
-            "anchor_eval_overlap": sorted(set(anchor_ids) & set(eval_ids)),
+            "sql_model_selection_database_ids": selection_ids,
+            "sql_evaluation_database_ids": eval_ids,
             "official_evaluator_commit": "e97acc546ecbee8fa27fa8dbf025ef61493a876c",
             "official_data_zip_sha256": (
                 "00636695dabed6b5f4b8328a16b13e069a2f16591d5efcce57660669c85b121b"
@@ -272,14 +273,24 @@ def evaluate_spider(
     return {
         "name": branch,
         "examples": count,
+        "execution_accuracy": official["execution"],
+        "official_structural_exact_match": official["exact_match"],
+        "valid_query_rate": totals["executable"] / count,
+        "normalized_string_exact_match": totals["exact"] / count,
+        "local_denotation_accuracy": totals["denotation"] / count,
         "exact_match": official["exact_match"],
-        "execution_rate": official["execution"],
-        "denotation_accuracy": official["execution"],
-        "single_database_exact": totals["exact"] / count,
-        "single_database_execution": totals["executable"] / count,
-        "single_database_denotation": totals["denotation"] / count,
         "mean_reward": totals["reward"] / count,
         "official_metric": "Spider test-suite execution without value plugging",
+        "metric_definitions": {
+            "execution_accuracy": "official Spider Test Suite execution accuracy",
+            "exact_match": "official Spider structural exact match",
+            "official_structural_exact_match": "official Spider structural exact match",
+            "valid_query_rate": "fraction of generated SQL that parses and executes without error",
+            "normalized_string_exact_match": "normalized SQL string equality; diagnostic only",
+            "local_denotation_accuracy": (
+                "single-database execution-result equality; diagnostic only"
+            ),
+        },
         "seconds": time.time() - started,
     }
 
@@ -306,13 +317,15 @@ def finish_prepare(config: SpiderConfig) -> None:
     source = Path(config.code_pool_source)
     rows = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
     if not rows:
-        raise ValueError("validated M5 code pool is empty")
+        raise ValueError("validated paper code pool is empty")
+    full.validate_code_pool(rows, config)
     shutil.copy2(source, destination)
-    sql_train, sql_anchor, sql_eval = spider_data.load_spider_data(config)
+    sql_train, sql_anchor, sql_model_selection, sql_eval = spider_data.load_spider_data(config)
     save_spider_manifest(
         experiment_dir,
         sql_train,
         sql_anchor,
+        sql_model_selection,
         sql_eval,
         _code_manifest(config, len(rows)),
     )
@@ -326,7 +339,7 @@ def finish_prepare(config: SpiderConfig) -> None:
 
 
 def validate_data(config: SpiderConfig) -> None:
-    sql_train, sql_anchor, sql_eval = spider_data.load_spider_data(config)
+    sql_train, sql_anchor, sql_model_selection, sql_eval = spider_data.load_spider_data(config)
     test_suite_dir = Path(config.spider_test_suite_db_dir)
     eval_ids = {str(row["db_id"]) for row in sql_eval}
     missing_test_suites = sorted(
@@ -339,11 +352,16 @@ def validate_data(config: SpiderConfig) -> None:
             f"missing official Spider test suites: {missing_test_suites}"
         )
     report = {
-        "train_examples": len(sql_train),
+        "training_partition_examples": len(sql_train) + len(sql_anchor),
+        "optimization_examples": len(sql_train),
         "anchor_examples": len(sql_anchor),
-        "eval_examples": len(sql_eval),
-        "train_database_ids": len({row["db_id"] for row in sql_train}),
+        "model_selection_examples": len(sql_model_selection),
+        "evaluation_examples": len(sql_eval),
+        "optimization_database_ids": len({row["db_id"] for row in sql_train}),
         "anchor_database_ids": len({row["db_id"] for row in sql_anchor}),
+        "model_selection_database_ids": len(
+            {row["db_id"] for row in sql_model_selection}
+        ),
         "eval_database_ids": len(eval_ids),
         "test_suite_sqlite_files": sum(
             len(list((test_suite_dir / database_id).glob("*.sqlite")))
@@ -368,8 +386,9 @@ def train_only_branch(config: SpiderConfig, branch_name: str) -> None:
     )
     full.core.seed_everything(config.seed + 101)
     tokenizer = full.tokenizer_for(config)
-    sql_train, sql_anchor, _ = spider_data.load_spider_data(config)
+    sql_train, sql_anchor, _, _ = spider_data.load_spider_data(config)
     code_pool = full.load_saved_code_pool(experiment_dir / "code_pool.jsonl")
+    full.validate_code_pool(code_pool, config)
     model = full.core.restore_model(
         config, tokenizer, experiment_dir / "common_sql_trainable.pt"
     )
@@ -384,15 +403,22 @@ def train_only_branch(config: SpiderConfig, branch_name: str) -> None:
         branch_dir / "trace.jsonl",
     )
     full.release_cuda_memory()
-    full.atomic_save_trainable(model, branch_dir / "trainable.pt")
+    deployment = full.deploy_branch_checkpoint(
+        model,
+        experiment_dir / "common_sql_trainable.pt",
+        branch_dir,
+        full.branch_spec(branch_name),
+        config.checkpoint_interpolation_alpha,
+    )
+    full.write_json(branch_dir / "deployment.json", deployment)
     full.release_cuda_memory()
     full.write_json(
         branch_dir / "TRAIN_ONLY_COMPLETE.json",
-        {"branch": branch_name, "updates": len(code_pool)},
+        {"branch": branch_name, "updates": config.rl_steps, "deployment": deployment},
     )
     print(
         json.dumps(
-            {"trained_without_evaluation": branch_name, "updates": len(code_pool)},
+            {"trained_without_evaluation": branch_name, "updates": config.rl_steps},
             indent=2,
         ),
         flush=True,
@@ -412,6 +438,7 @@ def build_parser() -> argparse.ArgumentParser:
         model=SMOLLM3_MODEL,
         model_revision=SMOLLM3_REVISION,
         model_cache_dir=SMOLLM3_CACHE_DIR,
+        lora_rank=16,
         max_length=512,
         sql_new_tokens=256,
         sft_batch_size=1,
@@ -470,6 +497,8 @@ def parse_args(
         config = _config_from_values(saved)
     else:
         config = _config_from_values(vars(args))
+        if not full.option_was_provided(argv, "--lora-rank"):
+            config.lora_rank = full.paper_lora_rank(config.model)
         if config.top_p != 1.0:
             parser.error("--top-p must be 1.0 for on-policy RL")
         if config.max_length <= config.sql_new_tokens:

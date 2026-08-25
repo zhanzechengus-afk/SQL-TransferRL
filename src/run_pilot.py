@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import ast
 import contextlib
 import json
@@ -16,7 +15,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -28,7 +27,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
 from private_adapters import DomainPrivateAdapters
 
@@ -49,20 +48,20 @@ class RunConfig:
     model_cache_dir: str = ""
     seed: int = 13
     warmup_steps: int = 48
-    rl_steps: int = 32
+    rl_steps: int = 1362
     eval_examples: int = 48
     train_examples: int = 384
     learning_rate: float = 1.0e-4
-    adapter_dim: int = 128
+    adapter_dim: int = 96
     adapter_type: str = "output"
     adapter_top_k: int = 6
     lora_rank: int = 8
     max_length: int = 512
-    sql_new_tokens: int = 96
-    code_new_tokens: int = 160
+    sql_new_tokens: int = 48
+    code_new_tokens: int = 128
     sql_sft_weight: float = 0.20
     code_sft_weight: float = 0.10
-    auxiliary_weight: float = 0.70
+    auxiliary_weight: float = 0.30
     max_aux_scale: float = 2.0
     alignment_temperature: float = 0.02
     curriculum_probe_examples: int = 96
@@ -71,7 +70,7 @@ class RunConfig:
     top_p: float = 1.0
     rl_loss: str = "ema_reinforce"
     group_size: int = 2
-    reference_kl_weight: float = 0.0
+    reference_kl_weight: float = 0.02
     kl_token_chunk_size: int = 8
     output_dir: str = "results"
     smoke: bool = False
@@ -1387,130 +1386,11 @@ def restore_model(config: RunConfig, tokenizer: Any, state_path: Path) -> Domain
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen2.5-Coder-3B-Instruct")
-    parser.add_argument("--model-revision", default="")
-    parser.add_argument("--model-cache-dir", default="")
-    parser.add_argument("--seed", type=int, default=13)
-    parser.add_argument("--warmup-steps", type=int, default=48)
-    parser.add_argument("--rl-steps", type=int, default=32)
-    parser.add_argument("--eval-examples", type=int, default=48)
-    parser.add_argument("--train-examples", type=int, default=384)
-    parser.add_argument("--learning-rate", type=float, default=1.0e-4)
-    parser.add_argument("--adapter-dim", type=int, default=128)
-    parser.add_argument(
-        "--adapter-type",
-        "--adapter-kind",
-        dest="adapter_type",
-        choices=("none", "output", "top_k", "layerwise"),
-        default="output",
+    raise SystemExit(
+        "run_pilot.py provides shared model and loss utilities. "
+        "Use run_full_experiment.py, run_spider_experiment.py, or "
+        "run_bird_experiment.py for the paper-aligned pipelines."
     )
-    parser.add_argument("--adapter-top-k", type=int, default=6)
-    parser.add_argument("--lora-rank", type=int, default=8)
-    parser.add_argument("--alignment-temperature", type=float, default=0.02)
-    parser.add_argument("--curriculum-probe-examples", type=int, default=96)
-    parser.add_argument("--curriculum-size", type=int, default=32)
-    parser.add_argument(
-        "--rl-loss", choices=("ema_reinforce", "group_relative"), default="ema_reinforce"
-    )
-    parser.add_argument("--group-size", type=int, default=2)
-    parser.add_argument("--output-dir", default="results")
-    parser.add_argument("--smoke", action="store_true")
-    args = parser.parse_args()
-    config = RunConfig(**vars(args))
-    if config.smoke:
-        config.warmup_steps = min(config.warmup_steps, 8)
-        config.rl_steps = min(config.rl_steps, 4)
-        config.eval_examples = min(config.eval_examples, 8)
-        config.train_examples = min(config.train_examples, 48)
-        config.sql_new_tokens = 64
-        config.code_new_tokens = 96
-        config.curriculum_probe_examples = min(config.curriculum_probe_examples, 8)
-        config.curriculum_size = min(config.curriculum_size, 4)
-
-    seed_everything(config.seed)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(config.output_dir) / f"{timestamp}_seed{config.seed}"
-    run_dir.mkdir(parents=True, exist_ok=False)
-    write_json(run_dir / "config.json", asdict(config))
-    trace_path = run_dir / "trace.jsonl"
-    predictions_path = run_dir / "predictions.jsonl"
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model,
-        revision=getattr(config, "model_revision", "") or None,
-        cache_dir=getattr(config, "model_cache_dir", "") or None,
-        use_fast=True,
-    )
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    sql_train, sql_anchor, sql_eval, code_train = load_real_data(config)
-    write_json(
-        run_dir / "data_manifest.json",
-        {
-            "sql_dataset": "Salesforce/wikisql",
-            "code_dataset": "google-research-datasets/mbpp (sanitized when available)",
-            "sql_train_examples": len(sql_train),
-            "sql_anchor_examples": len(sql_anchor),
-            "sql_eval_examples": len(sql_eval),
-            "code_train_examples": len(code_train),
-        },
-    )
-
-    common = build_model(config, tokenizer)
-    warmup(common, tokenizer, sql_train, code_train, config, trace_path)
-    common_state = run_dir / "common_trainable.pt"
-    torch.save(common.trainable_state(), common_state)
-    code_curriculum = build_code_curriculum(
-        common,
-        tokenizer,
-        sql_anchor,
-        code_train,
-        config,
-        run_dir / "curriculum.json",
-    )
-    summaries = [
-        evaluate_sql("common", common, tokenizer, sql_eval, config, predictions_path)
-    ]
-    del common
-    torch.cuda.empty_cache()
-
-    for branch in ("sql_only", "sql_only_2x", "target_aligned"):
-        seed_everything(config.seed + 101)
-        model = restore_model(config, tokenizer, common_state)
-        train_branch(
-            branch,
-            model,
-            tokenizer,
-            sql_train,
-            sql_anchor,
-            code_curriculum if branch == "target_aligned" else code_train,
-            config,
-            trace_path,
-        )
-        torch.save(model.trainable_state(), run_dir / f"{branch}_trainable.pt")
-        summaries.append(
-            evaluate_sql(branch, model, tokenizer, sql_eval, config, predictions_path)
-        )
-        del model
-        torch.cuda.empty_cache()
-
-    result = {
-        "run_dir": str(run_dir),
-        "config": asdict(config),
-        "results": summaries,
-        "target_aligned_minus_sql_only": next(
-            item["denotation_accuracy"] for item in summaries if item["name"] == "target_aligned"
-        )
-        - next(item["denotation_accuracy"] for item in summaries if item["name"] == "sql_only"),
-        "target_aligned_minus_sql_only_2x": next(
-            item["denotation_accuracy"] for item in summaries if item["name"] == "target_aligned"
-        )
-        - next(item["denotation_accuracy"] for item in summaries if item["name"] == "sql_only_2x"),
-    }
-    write_json(run_dir / "summary.json", result)
-    print(json.dumps(result, indent=2), flush=True)
 
 
 if __name__ == "__main__":
