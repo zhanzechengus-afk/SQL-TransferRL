@@ -52,12 +52,12 @@ class RunConfig:
     rl_steps: int = 32
     eval_examples: int = 48
     train_examples: int = 384
-    learning_rate: float = 2.0e-4
+    learning_rate: float = 1.0e-4
     adapter_dim: int = 128
     adapter_type: str = "output"
     adapter_top_k: int = 6
     lora_rank: int = 8
-    max_length: int = 448
+    max_length: int = 512
     sql_new_tokens: int = 96
     code_new_tokens: int = 160
     sql_sft_weight: float = 0.20
@@ -1396,7 +1396,7 @@ def main() -> None:
     parser.add_argument("--rl-steps", type=int, default=32)
     parser.add_argument("--eval-examples", type=int, default=48)
     parser.add_argument("--train-examples", type=int, default=384)
-    parser.add_argument("--learning-rate", type=float, default=2.0e-4)
+    parser.add_argument("--learning-rate", type=float, default=1.0e-4)
     parser.add_argument("--adapter-dim", type=int, default=128)
     parser.add_argument(
         "--adapter-type",

@@ -315,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
             action.choices = tuple(action.choices) + ("validate_data",)
             break
     parser.set_defaults(
-        max_length=3072,
+        max_length=512,
         sql_new_tokens=256,
         sft_batch_size=1,
         sft_gradient_accumulation=16,

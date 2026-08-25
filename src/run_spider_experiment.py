@@ -412,7 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
         model=SMOLLM3_MODEL,
         model_revision=SMOLLM3_REVISION,
         model_cache_dir=SMOLLM3_CACHE_DIR,
-        max_length=3072,
+        max_length=512,
         sql_new_tokens=256,
         sft_batch_size=1,
         sft_gradient_accumulation=16,
